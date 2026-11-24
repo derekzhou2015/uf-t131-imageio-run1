@@ -258,6 +258,31 @@ def is_volume(ndimage):
         return False
 
 
+def _apply_v2_gif_defaults(plugin_instance, request, kwargs):
+    """Restore the v2 default of looping written GIFs indefinitely.
+
+    The v2 API documents ``loop`` as defaulting to 0 (loop forever). Legacy
+    formats (e.g. ``GIF-PIL``) implement that default themselves in their
+    writer, but when a ``.gif`` request is handled by the v3 ``pillow`` plugin
+    the write kwargs are forwarded to Pillow untouched, and Pillow omits the
+    NETSCAPE loop extension unless it is given a ``loop`` value. That makes
+    the resulting animation play exactly once and stop on the last frame.
+    Re-introduce the documented default for that specific plugin only, so
+    neither other backends nor the ``imageio.v3`` API are affected.
+    """
+    is_pillow_plugin = type(plugin_instance).__name__ == "PillowPlugin"
+    if (
+        not is_pillow_plugin
+        or request.extension != ".gif"
+        or "loop" in kwargs
+    ):
+        return kwargs
+
+    kwargs = dict(kwargs)
+    kwargs["loop"] = 0
+    return kwargs
+
+
 # Base functions that return a reader/writer
 
 
@@ -322,6 +347,7 @@ def get_writer(uri, format=None, mode="?", **kwargs):
     imopen_args["legacy_mode"] = True
 
     image_file = imopen(uri, "w" + mode, **imopen_args)
+    kwargs = _apply_v2_gif_defaults(image_file, image_file.request, kwargs)
     if isinstance(image_file, LegacyPlugin):
         return image_file.legacy_get_writer(**kwargs)
     else:
@@ -394,6 +420,7 @@ def imwrite(uri, im, format=None, **kwargs):
     imopen_args = decypher_format_arg(format)
     imopen_args["legacy_mode"] = True
     with imopen(uri, "wi", **imopen_args) as file:
+        kwargs = _apply_v2_gif_defaults(file, file.request, kwargs)
         return file.write(im, **kwargs)
 
 
@@ -492,6 +519,7 @@ def mimwrite(uri, ims, format=None, **kwargs):
     imopen_args = decypher_format_arg(format)
     imopen_args["legacy_mode"] = True
     with imopen(uri, "wI", **imopen_args) as file:
+        kwargs = _apply_v2_gif_defaults(file, file.request, kwargs)
         return file.write(ims, is_batch=True, **kwargs)
 
 

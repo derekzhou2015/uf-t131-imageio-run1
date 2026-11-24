@@ -98,6 +98,32 @@ def intToBin(i):
     return i.to_bytes(2, byteorder="little")
 
 
+def colorTableSizeBits(palette):
+    """Return the GIF color table size field (``log2(entries) - 1``).
+
+    The size field in a GIF header/image descriptor is three bits wide and
+    encodes the table size as ``2**(field + 1)`` entries. Pillow hands out
+    palettes that are already padded to a power-of-two number of entries
+    (minimum 4), but the exact size depends on the image and on the Pillow
+    version, so it must be derived from the palette itself rather than
+    hard-coded.
+    """
+    n_entries = max(min(len(palette) // 3, 256), 1)
+    return max((n_entries - 1).bit_length() - 1, 0)
+
+
+def padPalette(palette):
+    """Pad a palette to the full color table size declared for it."""
+    size_bits = colorTableSizeBits(palette)
+    target = 3 * (2 << size_bits)
+    palette = bytes(palette)
+    if len(palette) < target:
+        palette += b"\x00" * (target - len(palette))
+    else:
+        palette = palette[:target]
+    return palette, size_bits
+
+
 class GifWriter:  # pragma: no cover
     """Class that for helping write the animated GIF file. This is based on
     code from images2gif.py (part of visvis). The version here is modified
@@ -140,6 +166,12 @@ class GifWriter:  # pragma: no cover
         from PIL.GifImagePlugin import getheader
 
         palette = getheader(im_pil)[0][3]
+        # The color table size field in the headers we write must match the
+        # number of entries actually stored. Pillow no longer pads palettes
+        # to 256 entries (it pads to the nearest power of two that covers the
+        # colors in use), so derive the size from the palette and pad it to
+        # the declared size.
+        palette, self._palette_size_bits = padPalette(palette)
 
         # Write image
         if self._count == 0:
@@ -154,7 +186,7 @@ class GifWriter:  # pragma: no cover
 
     def write_header(self, im, globalPalette, loop):
         # Gather info
-        header = self.getheaderAnim(im)
+        header = self.getheaderAnim(im, globalPalette)
         appext = self.getAppExt(loop)
         # Write
         self.fp.write(header)
@@ -177,8 +209,8 @@ class GifWriter:  # pragma: no cover
             imdes += data.pop(0)
         assert len(imdes) == 11
 
-        # Make image descriptor suitable for using 256 local color palette
-        lid = self.getImageDescriptor(im, rect)
+        # Make image descriptor suitable for the current color palette
+        lid = self.getImageDescriptor(im, rect, self._palette_size_bits)
         graphext = self.getGraphicsControlExt(duration, dispose)
 
         # Write local header
@@ -197,15 +229,26 @@ class GifWriter:  # pragma: no cover
         for d in data:
             fp.write(d)
 
-    def getheaderAnim(self, im):
-        """Get animation header. To replace PILs getheader()[0]"""
+    def getheaderAnim(self, im, palette=None):
+        """Get animation header. To replace PILs getheader()[0]
+
+        The packed field of the logical screen descriptor carries the size of
+        the global color table, so it has to be derived from the palette that
+        is written right after this header.
+        """
+        if palette is None:
+            size_bits = getattr(self, "_palette_size_bits", 7)
+        else:
+            size_bits = colorTableSizeBits(palette)
         bb = b"GIF89a"
         bb += intToBin(im.size[0])
         bb += intToBin(im.size[1])
-        bb += b"\x87\x00\x00"
+        # packed field: global color table flag1, color resolution0,
+        # sorted table0, reserved00, gct size bits.
+        bb += bytes([0x80 | size_bits, 0x00, 0x00])
         return bb
 
-    def getImageDescriptor(self, im, xy=None):
+    def getImageDescriptor(self, im, xy=None, size_bits=None):
         """Used for the local color table properties per image.
         Otherwise global color table applies to all frames irrespective of
         whether additional colors comes in play that require a redefined
@@ -219,6 +262,9 @@ class GifWriter:  # pragma: no cover
         if xy is None:
             xy = (0, 0)
 
+        if size_bits is None:
+            size_bits = getattr(self, "_palette_size_bits", 7)
+
         # Image separator,
         bb = b"\x2c"
 
@@ -229,8 +275,8 @@ class GifWriter:  # pragma: no cover
         bb += intToBin(im.size[1])  # image height
 
         # packed field: local color table flag1, interlace0, sorted table0,
-        # reserved00, lct size111=7=2^(7 + 1)=256.
-        bb += b"\x87"
+        # reserved00, lct size bits (2**(bits + 1) entries).
+        bb += bytes([0x80 | size_bits])
 
         # LZW minimum size code now comes later, beginning of [imagedata] blocks
         return bb
@@ -302,8 +348,11 @@ class GifWriter:  # pragma: no cover
         Y = np.argwhere(diff.sum(1))
         # Get rect coordinates
         if X.size and Y.size:
-            x0, x1 = int(X[0]), int(X[-1] + 1)
-            y0, y1 = int(Y[0]), int(Y[-1] + 1)
+            # X/Y come from np.argwhere and are single-element arrays; indexing
+            # them yields an array (converting that to int is an error on
+            # NumPy >= 2), so pick the scalar out explicitly.
+            x0, x1 = int(X[0][0]), int(X[-1][0] + 1)
+            y0, y1 = int(Y[0][0]), int(Y[-1][0] + 1)
         else:  # No change ... make it minimal
             x0, x1 = 0, 2
             y0, y1 = 0, 2

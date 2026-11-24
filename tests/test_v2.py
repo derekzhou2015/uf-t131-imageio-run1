@@ -1,6 +1,10 @@
+import io
+
 import pytest
 import imageio.v2 as iio
+import imageio.v3 as iio3
 import numpy as np
+from PIL import Image
 
 
 def test_reader(test_images):
@@ -86,3 +90,59 @@ def test_kwarg_forwarding(tmp_path):
         assert img.shape == (100, 100)
         assert img.meta["duration"] == 1000
         assert img.meta["loop"] == 0
+
+
+def _make_frames(n=4, shape=(32, 48, 3)):
+    rng = np.random.default_rng(42)
+    return [rng.integers(0, 255, shape, dtype=np.uint8) for _ in range(n)]
+
+
+@pytest.mark.parametrize("writer", ["mimwrite", "get_writer"])
+def test_gif_default_loops_forever(tmp_path, writer):
+    """Regression test: the default v2 GIF export must loop indefinitely.
+
+    The v2 API documents ``loop`` as defaulting to 0 (loop forever), and the
+    default plugin used for ``.gif`` writes (the v3 ``pillow`` plugin) only
+    emits a NETSCAPE loop extension when it is given a ``loop`` value. Without
+    the v2 default the written animations play exactly once and stop on their
+    last frame.
+    """
+    frames = _make_frames()
+    path = tmp_path / "animated.gif"
+
+    if writer == "mimwrite":
+        iio.mimwrite(path, frames)
+    else:
+        with iio.get_writer(path) as file:
+            for frame in frames:
+                file.append_data(frame)
+
+    data = path.read_bytes()
+    assert b"NETSCAPE2.0" in data
+
+    with Image.open(io.BytesIO(data)) as im:
+        assert im.info["loop"] == 0
+        assert im.n_frames == len(frames)
+        # the loop extension has to be read back by imageio as well
+        frames_back = iio.mimread(path)
+        assert len(frames_back) == len(frames)
+
+
+def test_gif_explicit_loop_is_respected(tmp_path):
+    """An explicitly requested loop count must not be overridden."""
+    frames = _make_frames(n=3)
+    path = tmp_path / "explicit.gif"
+    iio.mimwrite(path, frames, loop=2)
+
+    with Image.open(path) as im:
+        assert im.info["loop"] == 2
+
+
+def test_v3_gif_write_still_defaults_to_no_loop(tmp_path):
+    """The fix must not leak into the imageio.v3 write behavior."""
+    frames = np.stack(_make_frames(n=3))
+    data = iio3.imwrite("<bytes>", frames, extension=".gif")
+
+    assert b"NETSCAPE2.0" not in data
+    with Image.open(io.BytesIO(data)) as im:
+        assert im.info.get("loop") is None

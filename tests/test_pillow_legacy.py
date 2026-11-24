@@ -11,6 +11,7 @@ import pytest
 import imageio
 from imageio import core
 from conftest import deprecated_test
+from PIL import Image
 
 
 @deprecated_test
@@ -520,3 +521,154 @@ def test_write_jpg_to_bytes_io():
 
     image_from_file = imageio.imread(bytes_io)
     assert np.allclose(image_from_file, image)
+
+
+def _parse_gif(data):
+    """Walk a GIF file and return the declared color table sizes.
+
+    The returned list contains ``(kind, declared_entries)`` tuples for the
+    global color table and every local color table. Parsing is driven purely
+    by the size fields stored in the descriptors; if a field disagrees with
+    the bytes actually present the parser loses sync and raises AssertionError
+    before it reaches the trailer.
+    """
+    assert data[:3] == b"GIF"
+    pos = 6
+    width = int.from_bytes(data[pos : pos + 2], "little")
+    height = int.from_bytes(data[pos + 2 : pos + 4], "little")
+    flags = data[pos + 4]
+    assert width and height
+    pos += 7
+
+    color_tables = []
+    if flags & 0x80:
+        pos += 3 * (2 << (flags & 7))
+        color_tables.append(("global", 2 << (flags & 7)))
+
+    while pos < len(data):
+        block = data[pos]
+        pos += 1
+
+        if block == 0x3B:  # trailer
+            assert pos == len(data), "unexpected data after GIF trailer"
+            return color_tables
+        elif block == 0x21:  # extension
+            pos += 1  # extension label
+            while True:
+                size = data[pos]
+                pos += 1
+                if size == 0:
+                    break
+                pos += size
+        elif block == 0x2C:  # image separator
+            pos += 9  # image descriptor
+            local_flags = data[pos - 1]
+            if local_flags & 0x80:
+                entries = 2 << (local_flags & 7)
+                color_tables.append(("local", entries))
+                pos += 3 * entries
+            pos += 1  # LZW minimum code size
+            while True:
+                size = data[pos]
+                pos += 1
+                if size == 0:
+                    break
+                pos += size
+        else:  # pragma: no cover - corrupt stream
+            raise AssertionError(f"unexpected GIF block 0x{block:02x} at {pos - 1}")
+
+    raise AssertionError("GIF trailer not found")
+
+
+def _assert_readable_by_pil_and_imageio(data, n_frames):
+    buffered = io.BytesIO(data)
+
+    with Image.open(buffered) as im:
+        assert im.n_frames == n_frames
+        for frame_idx in range(n_frames):
+            im.seek(frame_idx)
+            im.load()
+            pixels = np.asarray(im.convert("RGB"))
+            assert pixels.shape[:2] == (im.size[1], im.size[0])
+
+    frames = imageio.mimread(io.BytesIO(data), format="GIF-PIL")
+    assert len(frames) == n_frames
+
+
+def test_gif_pil_color_table_matches_header(tmp_path):
+    """Regression test: the declared GIF color table size must match the data.
+
+    ``GifWriter`` writes the color table size into the logical screen
+    descriptor (and into each local image descriptor) as ``0x87``, i.e. a
+    256-entry table, and then copies Pillow's palette verbatim. Current
+    Pillow versions only pad palettes to the nearest power of two that covers
+    the colors in use, so the declared table grew far beyond the bytes that
+    were written. The resulting files are structurally broken and get rejected
+    as corrupt by other decoders.
+    """
+    frames = []
+    for idx in range(5):
+        frame = np.zeros((24, 32, 3), np.uint8)
+        frame[:, :] = (30 * idx, 200, 50)
+        frame[:12, :16] = (250, 220, 10)
+        # introduce a new color per frame to force a local color table
+        frame[12:, 16:] = (idx * 20, idx * 10, 240)
+        frames.append(frame)
+
+    path = tmp_path / "color_table.gif"
+    imageio.mimsave(path, frames, format="GIF-PIL")
+    data = path.read_bytes()
+
+    color_tables = _parse_gif(data)
+    assert color_tables[0][0] == "global"
+
+    # Every declared table must be a power-of-two table of at least 4 entries
+    # and, crucially, the palette has to actually contain that many entries.
+    for kind, entries in color_tables:
+        assert entries in (4, 8, 16, 32, 64, 128, 256), (kind, entries)
+
+    # The palette only needs a handful of colors, so the header must not
+    # unconditionally advertise 256 entries.
+    assert color_tables[0][1] < 256
+
+    _assert_readable_by_pil_and_imageio(data, len(frames))
+
+    # Round-trip: the decoded pixels equal the encoded ones (lossless quantize
+    # for these flat colors).
+    with Image.open(io.BytesIO(data)) as im:
+        first = np.asarray(im.convert("RGB"))
+    np.testing.assert_array_equal(first, frames[0])
+
+
+@pytest.mark.parametrize("palettesize", [2, 4, 16, 128, 256])
+def test_gif_pil_palettesize_header_consistency(tmp_path, palettesize):
+    """The ``palettesize`` kwarg must not desynchronize header and data."""
+    rng = np.random.default_rng(palettesize)
+    frames = [
+        rng.integers(0, 255, (24, 32, 3), dtype=np.uint8) for _ in range(3)
+    ]
+
+    path = tmp_path / f"palette_{palettesize}.gif"
+    imageio.mimsave(path, frames, format="GIF-PIL", palettesize=palettesize)
+    data = path.read_bytes()
+
+    color_tables = _parse_gif(data)
+    for kind, entries in color_tables:
+        assert entries <= max(4, palettesize), (kind, entries)
+
+    _assert_readable_by_pil_and_imageio(data, len(frames))
+
+
+def test_gif_pil_grayscale_color_table(tmp_path):
+    """Grayscale frames use a tiny color table that still has to match."""
+    rng = np.random.default_rng(7)
+    frames = [rng.integers(0, 255, (24, 32), dtype=np.uint8) for _ in range(4)]
+
+    path = tmp_path / "gray.gif"
+    imageio.mimsave(path, frames, format="GIF-PIL")
+    data = path.read_bytes()
+
+    color_tables = _parse_gif(data)
+    assert color_tables[0][0] == "global"
+
+    _assert_readable_by_pil_and_imageio(data, len(frames))
